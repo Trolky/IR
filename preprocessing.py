@@ -8,8 +8,8 @@ from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 from collections import Counter
 import num2words
+from datetime import datetime
 
-# Download necessary NLTK resources
 nltk.download('punkt')
 nltk.download('stopwords')
 nltk.download('wordnet')
@@ -24,12 +24,31 @@ class WowheadPreprocessor:
         self.use_lemmatization = use_lemmatization
         self.remove_diacritics = remove_diacritics
 
+    def normalize_dates(self, text):
+        date_pattern = re.compile(
+            r'\b(\d{4})/(\d{2})/(\d{2})(?:\s+AT\s+\d{1,2}:\d{2}\s+(?:AM|PM))?\b',
+            re.IGNORECASE
+        )
+
+        def replace_date(match):
+            try:
+                dt = datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                month = dt.strftime('%B').lower()          # january
+                day = num2words.num2words(dt.day, to='ordinal')   # twenty-ninth
+                year = num2words.num2words(dt.year)        # two thousand and twenty-six
+                return f"{month} {day} {year}"
+            except ValueError:
+                return match.group(0)
+
+        return date_pattern.sub(replace_date, text)
+
     def clean_text(self, text):
         if not text or not isinstance(text, str):
             return ""
 
         text = text.replace('\\n', ' ').replace('\n', ' ')
         text = re.sub(r'<[^>]+>', '', text)
+        text = self.normalize_dates(text)
 
         if self.remove_diacritics:
             text = unidecode(text)
