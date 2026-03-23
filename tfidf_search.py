@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Iterable, Set
 
 
 def tokenize_whitespace_lower(text: str) -> List[str]:
@@ -31,6 +31,20 @@ def tf_raw(tokens: Sequence[str]) -> Dict[str, float]:
     for t in tokens:
         tf[t] = tf.get(t, 0.0) + 1.0
     return tf
+
+
+def tf_weighted_log(tokens: Sequence[str]) -> Dict[str, float]:
+    """Compute weighted term frequency: 1 + log10(tf).
+
+    This is a common TF variant that dampens the impact of very frequent terms
+    within a document/query.
+
+    Notes:
+        - Terms with tf=0 don't appear in the output.
+        - For tf >= 1, weight is >= 1.
+    """
+    raw = tf_raw(tokens)
+    return {t: 1.0 + math.log10(c) for t, c in raw.items() if c > 0.0}
 
 
 def l2_norm(vec: Dict[str, float]) -> float:
@@ -128,6 +142,13 @@ class TfidfIndex:
         self._idf: Dict[str, float] = {}
         self._N: int = 0
 
+        # Inverted index over TF-IDF weights.
+        # term -> {doc_index -> tfidf_weight}
+        self._postings: Dict[str, Dict[int, float]] = {}
+
+        # Precomputed L2 norms for document TF-IDF vectors (same order as _doc_ids).
+        self._doc_norms: List[float] = []
+
     @property
     def N(self) -> int:
         """Number of indexed documents."""
@@ -161,28 +182,38 @@ class TfidfIndex:
         self._doc_tfidf = []
         self._df = {}
         self._idf = {}
+        self._postings = {}
+        self._doc_norms = []
         self._N = len(documents)
 
         # 1) compute df
         doc_tfs: List[Dict[str, float]] = []
         for doc_id, tokens in documents:
             self._doc_ids.append(doc_id)
-            tf = tf_raw(tokens)
+            tf = tf_weighted_log(tokens)
             doc_tfs.append(tf)
             for term in tf.keys():
                 self._df[term] = self._df.get(term, 0) + 1
 
         # 2) compute idf
-        # Note: when N=0, _df is empty, so this loop is safely skipped.
         for term, df in self._df.items():
-            self._idf[term] = math.log10(self._N / df)
+            self._idf[term] = math.log10(self._N / df) if self._N else 0.0
 
-        # 3) compute doc tf-idf
-        for tf in doc_tfs:
+        # 3) compute doc tf-idf + inverted index
+        for doc_i, tf in enumerate(doc_tfs):
             vec: Dict[str, float] = {}
             for term, c in tf.items():
-                vec[term] = c * self._idf.get(term, 0.0)
+                w = c * self._idf.get(term, 0.0)
+                if w == 0.0:
+                    continue
+                vec[term] = w
+                bucket = self._postings.get(term)
+                if bucket is None:
+                    bucket = {}
+                    self._postings[term] = bucket
+                bucket[doc_i] = w
             self._doc_tfidf.append(vec)
+            self._doc_norms.append(l2_norm(vec))
 
     def vectorize_query(self, query_tokens: Sequence[str], normalize: bool = False) -> Dict[str, float]:
         """Convert query tokens into a TF-IDF vector using the index IDF.
@@ -197,15 +228,27 @@ class TfidfIndex:
             Query TF-IDF sparse vector as dict term -> weight.
             If no query term is in the vocabulary, returns {}.
         """
-        q_tf = tf_raw(query_tokens)
+        q_tf = tf_weighted_log(query_tokens)
         q_vec: Dict[str, float] = {}
         for term, c in q_tf.items():
             if term in self._idf:
                 q_vec[term] = c * self._idf[term]
         return l2_normalize(q_vec) if normalize else q_vec
 
+    def _candidate_doc_indexes(self, query_terms: Iterable[str]) -> Set[int]:
+        """Return candidate document indexes (union of postings for query terms)."""
+        cand: Set[int] = set()
+        for t in query_terms:
+            p = self._postings.get(t)
+            if p:
+                cand.update(p.keys())
+        return cand
+
     def search(self, query_tokens: Sequence[str], k: int = 5, normalize: bool = True) -> List[SearchResult]:
         """Return top-k documents by cosine similarity to the query.
+
+        This version uses an inverted index so it only scores documents that
+        contain at least one in-vocabulary query term.
 
         Args:
             query_tokens: Query tokens.
@@ -219,6 +262,57 @@ class TfidfIndex:
             List of `SearchResult` sorted by descending score.
             If the query is empty / out-of-vocabulary, scores will be 0.0.
         """
+        # Build query tf-idf (optionally normalized).
+        q_vec = self.vectorize_query(query_tokens, normalize=normalize)
+
+        # If query is empty or entirely OOV, return top-k zeros (stable order).
+        if not q_vec:
+            return [SearchResult(doc_id=doc_id, score=0.0) for doc_id in self._doc_ids[:k]]
+
+        # Candidate docs = union of postings for query terms.
+        candidates = self._candidate_doc_indexes(q_vec.keys())
+        if not candidates:
+            return [SearchResult(doc_id=doc_id, score=0.0) for doc_id in self._doc_ids[:k]]
+
+        scored: List[SearchResult] = []
+
+        if normalize:
+            # With normalized vectors, cosine is just dot on overlapping terms.
+            # We'll accumulate dot products from postings directly.
+            acc: Dict[int, float] = {}
+            for term, q_w in q_vec.items():
+                postings = self._postings.get(term)
+                if not postings:
+                    continue
+                for doc_i, d_w in postings.items():
+                    acc[doc_i] = acc.get(doc_i, 0.0) + q_w * (d_w / self._doc_norms[doc_i] if self._doc_norms[doc_i] else 0.0)
+
+            for doc_i, score in acc.items():
+                scored.append(SearchResult(doc_id=self._doc_ids[doc_i], score=score))
+        else:
+            # Raw cosine: dot / (||q|| * ||d||)
+            q_norm = l2_norm(q_vec)
+            if q_norm == 0.0:
+                return [SearchResult(doc_id=doc_id, score=0.0) for doc_id in self._doc_ids[:k]]
+
+            acc: Dict[int, float] = {}
+            for term, q_w in q_vec.items():
+                postings = self._postings.get(term)
+                if not postings:
+                    continue
+                for doc_i, d_w in postings.items():
+                    acc[doc_i] = acc.get(doc_i, 0.0) + q_w * d_w
+
+            for doc_i, dot in acc.items():
+                d_norm = self._doc_norms[doc_i]
+                score = dot / (q_norm * d_norm) if d_norm else 0.0
+                scored.append(SearchResult(doc_id=self._doc_ids[doc_i], score=score))
+
+        scored.sort(key=lambda r: r.score, reverse=True)
+        return scored[:k]
+
+    def search_bruteforce(self, query_tokens: Sequence[str], k: int = 5, normalize: bool = True) -> List[SearchResult]:
+        """Reference implementation: score all documents (slow), useful for tests."""
         if normalize:
             q_vec = self.vectorize_query(query_tokens, normalize=True)
             scored: List[SearchResult] = []
