@@ -1,3 +1,4 @@
+import heapq
 import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -7,7 +8,6 @@ def tokenize_boolean_query(query: str) -> List[str]:
     """Tokenize a boolean query.
 
     Supports operators (case-insensitive): AND, OR, NOT, and parentheses.
-    Terms are "words" (\w+) and may contain hyphens.
 
     Examples:
         "apple AND (banana OR cherry) NOT date"
@@ -68,7 +68,8 @@ def _to_rpn(tokens: Sequence[str]) -> List[str]:
         elif is_op(tok):
             while stack and is_op(stack[-1]):
                 top = stack[-1]
-                if (assoc[tok] == "left" and prec[tok] <= prec[top]) or (assoc[tok] == "right" and prec[tok] < prec[top]):
+                if (assoc[tok] == "left" and prec[tok] <= prec[top]) or (
+                        assoc[tok] == "right" and prec[tok] < prec[top]):
                     output.append(stack.pop())
                 else:
                     break
@@ -126,10 +127,16 @@ class BooleanIndex:
         - Terms are matched exactly as provided. You should normalize query terms
           the same way you normalize document tokens.
         - NOT uses the universe of all doc_ids currently present in the index.
+
+    Optimizations over the baseline:
+        1. AND NOT → set difference instead of materializing the full NOT set.
+        2. Short-circuit AND: returns immediately when the left operand is empty.
+        3. Short-circuit OR: returns immediately when the left operand equals _all_docs.
+        4. heapq.nsmallest used in search() when k is small relative to hits.
     """
 
     def __init__(self):
-        self._postings: Dict[str, Set[str]] = {}
+        self._postings: Dict[str, frozenset] = {}
         self._all_docs: Set[str] = set()
 
     @property
@@ -137,6 +144,7 @@ class BooleanIndex:
         return set(self._all_docs)
 
     def add_documents(self, documents: Iterable[Tuple[str, Sequence[str]]]) -> None:
+        pending: Dict[str, Set[str]] = {}
         for doc_id, tokens in documents:
             self._all_docs.add(doc_id)
             seen: Set[str] = set()
@@ -144,14 +152,17 @@ class BooleanIndex:
                 if t in seen:
                     continue
                 seen.add(t)
-                bucket = self._postings.get(t)
-                if bucket is None:
-                    bucket = set()
-                    self._postings[t] = bucket
-                bucket.add(doc_id)
+                pending.setdefault(t, set()).add(doc_id)
 
-    def postings(self, term: str) -> Set[str]:
-        return set(self._postings.get(term, set()))
+        for term, new_docs in pending.items():
+            existing = self._postings.get(term)
+            if existing is None:
+                self._postings[term] = frozenset(new_docs)
+            else:
+                self._postings[term] = existing | new_docs
+
+    def postings(self, term: str) -> frozenset:
+        return self._postings.get(term, frozenset())
 
     def evaluate(self, query: str) -> Set[str]:
         ast = parse_boolean_query(query)
@@ -160,16 +171,46 @@ class BooleanIndex:
     def _eval_node(self, node: _Node) -> Set[str]:
         if node.op == "TERM":
             assert node.value is not None
-            return set(self._postings.get(node.value, set()))
+            return self._postings.get(node.value, frozenset())
+
         if node.op == "NOT":
             assert node.left is not None
             return set(self._all_docs) - self._eval_node(node.left)
+
         if node.op == "AND":
             assert node.left is not None and node.right is not None
-            return self._eval_node(node.left) & self._eval_node(node.right)
+
+            # Opt 1: A AND (NOT B)  →  A - B  (avoids materializing _all_docs - B)
+            if node.right.op == "NOT":
+                assert node.right.left is not None
+                return self._eval_node(node.left) - self._eval_node(node.right.left)
+            if node.left.op == "NOT":
+                assert node.left.left is not None
+                return self._eval_node(node.right) - self._eval_node(node.left.left)
+
+            left = self._eval_node(node.left)
+
+            # Opt 2: short-circuit — empty left means intersection is always empty.
+            if not left:
+                return set()
+
+            right = self._eval_node(node.right)
+
+            if len(left) > len(right):
+                left, right = right, left
+            return left & right
+
         if node.op == "OR":
             assert node.left is not None and node.right is not None
-            return self._eval_node(node.left) | self._eval_node(node.right)
+
+            left = self._eval_node(node.left)
+
+            # Opt 3: short-circuit — if left already covers everything, OR adds nothing.
+            if left == self._all_docs:
+                return set(self._all_docs)
+
+            return left | self._eval_node(node.right)
+
         raise BooleanQueryParseError(f"Unknown node op: {node.op}")
 
     def search(self, query: str, k: Optional[int] = None) -> List[str]:
@@ -184,5 +225,7 @@ class BooleanIndex:
             stable output (boolean retrieval itself has no ranking).
         """
         hits = self.evaluate(query)
-        out = sorted(hits)
-        return out if k is None else out[:k]
+        if k is None:
+            return sorted(hits)
+
+        return heapq.nsmallest(k, hits)
